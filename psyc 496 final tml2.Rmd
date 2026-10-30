@@ -1,0 +1,184 @@
+---
+title: "Final Project"
+author: "Thomas Lee"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: cerulean
+    toc: yes
+    toc_depth: 4
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+  word_document:
+    toc: yes
+    toc_depth: '4'
+  pdf_document:
+    toc: yes
+    toc_depth: '4'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(nycflights13)
+library(leaps)
+library(tidyverse)
+library(magrittr)
+library(tree)
+library(caret)
+library(ISLR2)
+library(GGally)
+library(e1071)
+library(class)
+library(glmnet)
+library(pls)
+```
+
+## Introduction
+
+#### My hypothesis:
+Weather has a greater impact on departure delays than do other categories of airport logistics variables and thus weather variables can be used in deep learning predictive models of departure delays.
+
+#### My rationale: 
+Departure delays slow airports down. Through machine learning, we can have a better understanding of logistics variables related to departure delays. This could help streamline the prediction of flight delays, and such could be used to forewarn any ticketholders of possible delays farther ahead of time. That could in turn reduce crowding and other inefficiencies. Weather specifically is publicly available, forecastible data relating to events, such as thunderstorms and high winds, that can ground flights. Having an automated system for processing weather data and producing forecasts of delays could also help the flow of planes in and out of the airport. The other dataset, planes, is there to control for any factors related to the planes themselves for the delay. It’s also important to rule out the possibility that the specific airlines are prone to delays, so airlines is included to make any possible inclusion of airlines in the final metric readable.
+
+All variables in the nycflights13 package are tibbles and are easy to wrangle and combine. I will definitely only use data from one airport, potentially JFK, to keep constant factors specific to the airport. I can use k-fold cross validation for best subset selection (also for hypothesis testing), which then can be fed into a classification tree predictive model (due to the number of categorical variables), or just a regression predictive model if only quantitative variables are found to have any effect.
+	
+My hypothesis would be rejected if weather related variables do not have as much predictive power of flight delays as do other factors. Regardless of the effect size of weather variables, I need to demonstrate why their inclusion or exclusion matters.
+
+## Experiment
+
+### Data wrangling
+I need a workable dataset. To do this I need to combine the flights and weather datasets of nycflights13, remove redundant or unneccesary variables for our purposes, and work out my controls.
+```{r} 
+f_ <- flights
+w_ <- weather
+p_ <- planes # used if "tailnum" is found to be significant
+a_ <- airlines # this may be used later for the sake of communication if significant
+```
+```{r}
+# joining f_ and w_ to form main point of comparison
+fw <- full_join(f_,w_)
+```
+Now that these datasets are joined, we can remove redundant date metrics that could confuse the learning model (all except month, explained below), and the arrival variables (which are not predictive of departure variables and the correlate too strongly to simply leave in). We also don't need any info about departure time or scheduled departure time, since we already have departure delay in its own column. I'm also going to exclude air_time and distance as they cannot be used as an IV for departure delay.
+
+For the sake of analysis, including month, as a factor, would allow us to have a qualitative variable with a low number of levels for my later tree method related to time of year. This could account for, say, holiday travel.
+```{r} 
+trunc_fw <- select(fw,dep_delay, carrier, tailnum, origin, 
+                   month, temp, dewp, humid, wind_dir, wind_speed, 
+                   wind_gust, precip, pressure, visib)
+
+# now, let's control for origin. We only want JFK.
+trunc_fw %<>% filter(origin == "JFK")
+
+# We don't need to include that as a column anymore.
+trunc_fw %<>% select(dep_delay, carrier, tailnum, 
+                   month, temp, dewp, humid, wind_dir, wind_speed, 
+                   wind_gust, precip, pressure, visib)
+```
+
+### Model fitting
+#### Qualitative variables
+Departure delay is a continuous variable. The weather variables are also continuous variables. However, my potential confounds of carrier, plane type, month and destination are all qualitative. In order to proceed, I need to create a separate model to see if any of the qualitative confounds have any effect on delays, or at least to compare to the strength of quantitative predictors.
+
+As stated earlier, it is possible that the time of year, represented by month, has an effect on travel rates due to school and federal holidays and the like. Therefore month here represents more so a behavior pattern than a continuous measure of time.
+
+In my final model, the tree classification method was used. I decided to only test carrier and month, since there were too many different plane types and airports to reasonably analyze. This is a major limitation of my experiment.
+```{r} 
+# create a new tibble, but include only the dep_delay and carrier
+# also, turn dep_delay into a qualitative variable by dichotomizing whether or not delayed.
+# new classifier replaces quantitative column
+qual_fw <- trunc_fw %>% select(dep_delay, month, carrier) %>% 
+  mutate(delayed = as.factor(ifelse(.$dep_delay>0, "Yes", "No"))) %>%
+  relocate(delayed, .after=dep_delay) %>%
+  select(-c(1))
+#making sure all the columns are now factors
+qual_fw %<>% mutate_if(is.character, as.factor)
+qual_fw %<>% mutate_if(is.integer, as.factor)
+summary(qual_fw)
+```
+Now, I'm going to use a classification tree method to investigate the variables
+```{r} 
+qual_fw_fit <- tree(delayed~., qual_fw)
+summary(qual_fw_fit)
+```
+As demonstrated, attempting to use carrier as a prediction of departure delay has no effect. Even though the model found that month could actually be used in tree construction, it has a high misclassification error rate. Due to the results and limitations found through this exploration, I concluded that my quantitative variables are more worthy of being included in my machine learning model. This rejects the existence of the confounds of carrier competency or the time of year.
+
+#### Quantitative variables
+I decided to use the k-fold cross-validation resampling, and the forward method of variable selection for my quantitative variables.
+
+This dataset has many, many NA values. wind_gust alone has 262,263 NA values, which would disqualify 76% of my rows. Since wind gust speeds may in fact play a role in departure delays, I'm not going to outright eliminate it. If the variable has a small to insignificant effect, I can re-do the k-fold c-v without it, and have more data to work off of.
+```{r} 
+# selecting only quant variables
+quant_fw <- trunc_fw %>% select(dep_delay, 
+                   temp, dewp, humid, wind_dir, wind_speed, 
+                   wind_gust, precip, pressure, visib)
+```
+```{r}
+# inclusive of wind gust
+# removing all NA
+quant_fw_no_na <- quant_fw %>% filter(if_all(everything(), ~!is.na(.x)))
+
+# forward selection method 
+fsm_quant_fw<-regsubsets(dep_delay~.,data=quant_fw_no_na,method = "forward",nbest = 1,nvmax = 11)
+
+# function for finding the best predictors
+myfunct<-function(id,model_obj,response) {
+   the_best<-summary(model_obj)$which[id,-1]
+   predictors<-names(which(the_best==TRUE))%>%
+                str_c(collapse="+")
+  as.formula(str_c(response,"~",predictors))
+}
+
+# helper function for k-fold cross validation
+cv_error<-function(model_formula,data){
+  set.seed(666)
+  cv_method<-trainControl(method="cv",number=10)
+  cv_flights<-train(model_formula, data = data, method="lm",trControl=cv_method)
+  cv_flights$results$RMSE
+}
+
+# choosing the subset with the lowest error
+ids<-1:nrow(summary(fsm_quant_fw)$which) 
+my_cv_error<-map(ids,myfunct,fsm_quant_fw,"dep_delay")%>%
+              map(cv_error,data=quant_fw_no_na)%>%
+              unlist()
+
+k <- which.min(my_cv_error)
+
+# showing the coefficients it chose
+coef(fsm_quant_fw,k)
+```
+The results show that the model picked the variables of temp, humid, wind_dir, wind_speed, wind_gust, precip, pressure and visib out of the 9 potential independent variables. The only variable that was excluded was the dewpoint.
+
+You can see the results of the fsm below. Most models tend to include humidity, visibility and wind gust. The latter signals that making a model omitting it would have been invalid.
+```{r} 
+plot(fsm_quant_fw)
+```
+
+Now I'll try a pcr model. 
+```{r} 
+set.seed(666)
+pcr_fw_model<-pcr(dep_delay~.,data=quant_fw_no_na,scale=TRUE, validation="CV")
+summary(pcr_fw_model)
+```
+And now a validation plot to show the results of the pcr.
+```{r} 
+validationplot(pcr_fw_model,val.type = "MSEP")
+```
+
+
+It seems like the pcr and forward selection models settle on 8 variables. This amount of concurrance supports that weather variables are powerful predictors of departure delays.
+
+
+
+## Conclusion
+It appears that weather is the sole and ultimate predictor of departure delays among the data included in the nycflights13 dataset. My results fail to reject my hypothesis. Tracking weather should be the primary emphasis of any model and airport could use to predict flight delays. If the data can be gathered ahead of time, then predicted delays could be sent out to patrons to advise their plans, and potentially avoiding congestion in the airport from people waiting for their flights.
+
+It is also important to note that my data did not emphasize the importance of non-weather factors in delays, so my data could be grounds for further research into whether anomalies in delay times when compared against the model could signal a shift in these other factors. Having a regular point of comparison (eg, a predictive model that primarily focuses on weather), could be use to investigate specific types of planes and airlines if their delays are regularly worse than predicted.
+
+
+
+
+
+
